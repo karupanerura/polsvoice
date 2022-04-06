@@ -8,8 +8,8 @@ import (
 )
 
 type MentionHandler struct {
-	StartRecChan      chan interface{}
-	DisconnectionChan chan interface{}
+	StartRecChan      chan struct{}
+	DisconnectionChan chan struct{}
 }
 
 var recMsgRe = regexp.MustCompile("\\s+rec$")

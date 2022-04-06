@@ -1,6 +1,7 @@
 package polsvoice
 
 import (
+	"context"
 	"os"
 	"os/signal"
 	"syscall"
@@ -10,7 +11,7 @@ import (
 )
 
 // Run is an entry point of the app.
-func Run(botToken string, serverID string, channelID string, filePrefix string) error {
+func Run(ctx context.Context, botToken string, serverID string, channelID string, filePrefix string, withSplitted bool) error {
 	discord, err := discordgo.New("Bot " + botToken)
 	if err != nil {
 		return err
@@ -27,38 +28,29 @@ func Run(botToken string, serverID string, channelID string, filePrefix string) 
 		}
 	}()
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
-	disconnectionChan := make(chan interface{}, 1)
+	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
+	defer cancel()
 
-	finishChan := make(chan interface{}, 1)
-	go func() {
-		select {
-		case <-disconnectionChan:
-			finishChan <- struct{}{}
-		case <-sigChan:
-			finishChan <- struct{}{}
-		}
-	}()
-
-	startRecChan := make(chan interface{}, 1)
+	startRecChan := make(chan struct{})
+	disconnectionChan := make(chan struct{})
 	mentionHandler := &MentionHandler{
 		StartRecChan:      startRecChan,
 		DisconnectionChan: disconnectionChan,
 	}
-	discord.AddHandler(mentionHandler.Handle)
+	removeMentionHandler := discord.AddHandler(mentionHandler.Handle)
+	defer close(startRecChan)
+	defer close(disconnectionChan)
+	defer removeMentionHandler()
+	ctx = contextWithSignal(ctx, disconnectionChan)
 
 	log.Info().Msg("standby recording in speaker mute")
-	alreadyDisconnectedChan := make(chan interface{}, 1)
 	initialVC, err := discord.ChannelVoiceJoin(serverID, channelID, true, true)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		select {
-		case <-alreadyDisconnectedChan:
+		if initialVC == nil {
 			return
-		default:
 		}
 
 		err := initialVC.Disconnect()
@@ -68,7 +60,7 @@ func Run(botToken string, serverID string, channelID string, filePrefix string) 
 	}()
 
 	select {
-	case <-finishChan:
+	case <-ctx.Done():
 		log.Info().Msg("finished app")
 		return nil
 	case <-startRecChan:
@@ -80,23 +72,37 @@ func Run(botToken string, serverID string, channelID string, filePrefix string) 
 	if err != nil {
 		return err
 	}
+	initialVC = nil // mark as disconnected
+
 	vc, err := discord.ChannelVoiceJoin(serverID, channelID, true, false)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		err = initialVC.Disconnect()
+		err = vc.Disconnect()
 		if err != nil {
 			log.Error().Err(err).Msg("failed to disconnect from voice channel")
 		}
 	}()
 
 	log.Info().Msg("start recording...")
-	recorder := NewRecorder(filePrefix)
-	err = recorder.Record(vc, finishChan)
+	recorder := NewRecorder(filePrefix, withSplitted)
+	err = recorder.Record(ctx, vc)
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func contextWithSignal(ctx context.Context, ch chan struct{}) context.Context {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-ch:
+		case <-ctx.Done():
+		}
+		cancel()
+	}()
+	return ctx
 }

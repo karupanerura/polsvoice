@@ -11,7 +11,10 @@ require (
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/google/go-cmp v0.5.7 // indirect
 	github.com/gorilla/websocket v1.4.0 // indirect
+	github.com/karupanerura/riffbin v0.0.4 // indirect
+	github.com/karupanerura/wavebin v0.0.3 // indirect
 	github.com/stretchr/testify v1.7.0 // indirect
 	github.com/youpy/go-riff v0.0.0-20131220112943-557d78c11efb // indirect
 	github.com/zaf/g711 v0.0.0-20190814101024-76a4a538f52b // indirect
