@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -31,12 +32,23 @@ func NewRecorder(filePrefix string, withSplitted bool) *Recorder {
 	}
 }
 
+func (r *Recorder) prepaseDir() error {
+	if os.IsPathSeparator(r.filePrefix[len(r.filePrefix)-1]) {
+		return os.MkdirAll(r.filePrefix, os.ModeDir|0o755)
+	}
+
+	return os.MkdirAll(filepath.Dir(r.filePrefix), os.ModeDir|0o755)
+}
+
 func (r *Recorder) Record(ctx context.Context, vc *discordgo.VoiceConnection) error {
-	rx := make(chan *discordgo.Packet, 2)
+	if err := r.prepaseDir(); err != nil {
+		return err
+	}
 
 	mixedRecorder, err := newFileRecorder(r.filePrefix + ".wav")
 	if err != nil {
 		log.Error().Err(err).Msgf("failed to open file %q", r.filePrefix+".wav")
+		return err
 	}
 
 	var splitedRecorder recorder = nopRecorder{}
@@ -44,6 +56,7 @@ func (r *Recorder) Record(ctx context.Context, vc *discordgo.VoiceConnection) er
 		splitedRecorder = newSplittedRecorder(r.filePrefix)
 	}
 
+	rx := make(chan *discordgo.Packet, 2)
 	go dgvoice.ReceivePCM(vc, rx)
 
 	var p *discordgo.Packet
@@ -64,7 +77,7 @@ func (r *Recorder) Record(ctx context.Context, vc *discordgo.VoiceConnection) er
 
 			// MEMO should flush all remained packets in rx channel?
 
-			return nil
+			return err
 		case p = <-rx:
 			err := mixedRecorder.recordFromPacket(p)
 			if err != nil {
@@ -158,10 +171,11 @@ func (e multiError) Error() string {
 const packetBuffLen = 256
 
 type fileRecorder struct {
-	f            *os.File
-	sampleWriter io.WriteCloser
-	bufioWriter  *bufio.Writer
-	buff         []*discordgo.Packet
+	f                 *os.File
+	sampleWriter      io.WriteCloser
+	bufioWriter       *bufio.Writer
+	buff              []*discordgo.Packet
+	lastWrittenPacket *discordgo.Packet
 }
 
 func newFileRecorder(fileName string) (*fileRecorder, error) {
@@ -194,6 +208,8 @@ func (r *fileRecorder) recordFromPacket(p *discordgo.Packet) error {
 	return nil
 }
 
+var muteSample = wavebin.PCM16BitStereoSample{L: 0, R: 0}
+
 func (r *fileRecorder) flushBuffer(max int) error {
 	sort.Slice(r.buff, func(i, j int) bool {
 		return r.buff[i].Sequence < r.buff[j].Sequence
@@ -201,6 +217,17 @@ func (r *fileRecorder) flushBuffer(max int) error {
 
 	pcmWriter := wavebin.PCMWriter{W: r.bufioWriter}
 	for _, p := range r.buff[:max] {
+		if r.lastWrittenPacket != nil {
+			samples := p.Timestamp - r.lastWrittenPacket.Timestamp
+			samples -= uint32(len(r.lastWrittenPacket.PCM) / 2)
+			for ; samples > 0; samples-- {
+				_, err := pcmWriter.WriteSamples(&muteSample)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
 		pcmLen := len(p.PCM)
 		for i := 0; i < pcmLen; i += 2 {
 			sample := wavebin.PCM16BitStereoSample{
@@ -213,6 +240,7 @@ func (r *fileRecorder) flushBuffer(max int) error {
 				return err
 			}
 		}
+		r.lastWrittenPacket = p
 	}
 	if max < len(r.buff) {
 		copy(r.buff[:max], r.buff[max:])

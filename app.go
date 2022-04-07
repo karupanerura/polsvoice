@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sync"
 	"syscall"
 
 	"github.com/bwmarrin/discordgo"
@@ -11,7 +13,7 @@ import (
 )
 
 // Run is an entry point of the app.
-func Run(ctx context.Context, botToken string, serverID string, channelID string, filePrefix string, withSplitted bool) error {
+func Run(ctx context.Context, botToken string, serverID string, outDir string) error {
 	discord, err := discordgo.New("Bot " + botToken)
 	if err != nil {
 		return err
@@ -31,68 +33,49 @@ func Run(ctx context.Context, botToken string, serverID string, channelID string
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	defer cancel()
 
-	startRecChan := make(chan struct{})
-	disconnectionChan := make(chan struct{})
-	mentionHandler := &MentionHandler{
-		StartRecChan:      startRecChan,
-		DisconnectionChan: disconnectionChan,
-	}
+	mentionHandler := NewMentionHandler(serverID)
 	removeMentionHandler := discord.AddHandler(mentionHandler.Handle)
-	defer close(startRecChan)
-	defer close(disconnectionChan)
+	defer mentionHandler.Terminate()
 	defer removeMentionHandler()
-	ctx = contextWithSignal(ctx, disconnectionChan)
 
-	log.Info().Msg("standby recording in speaker mute")
-	initialVC, err := discord.ChannelVoiceJoin(serverID, channelID, true, true)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if initialVC == nil {
-			return
+	wg := sync.WaitGroup{}
+	for {
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return nil
+		case req := <-mentionHandler.StartRecChan:
+			wg.Add(1)
+			go func(req RecordingRequest) {
+				defer wg.Done()
+				ctx := contextWithSignal(ctx, req.DisconnectionChan)
+
+				vc, err := discord.ChannelVoiceJoin(serverID, req.VoiceChannelID, true, false)
+				if err != nil {
+					log.Error().Err(err).Msgf("failed to connect to voice channel %q", req.VoiceChannelID)
+					req.Complete(err)
+					return
+				}
+				defer func() {
+					err := vc.Disconnect()
+					if err != nil {
+						log.Error().Err(err).Msg("failed to disconnect from voice channel")
+					}
+				}()
+
+				log.Info().Msg("start recording...")
+				recorder := NewRecorder(filepath.Join(outDir, req.FilePrefix), true)
+				err = recorder.Record(ctx, vc)
+				if err != nil {
+					log.Error().Err(err).Msgf("failed to recording: %v", err)
+					req.Complete(err)
+					return
+				}
+
+				req.Complete(nil)
+			}(req)
 		}
-
-		err := initialVC.Disconnect()
-		if err != nil {
-			log.Error().Err(err).Msg("failed to disconnect from voice channel in mute (i.e. initial state)")
-		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		log.Info().Msg("finished app")
-		return nil
-	case <-startRecChan:
-		// fall through
 	}
-
-	// reconnect to listen the voice channel
-	err = initialVC.Disconnect()
-	if err != nil {
-		return err
-	}
-	initialVC = nil // mark as disconnected
-
-	vc, err := discord.ChannelVoiceJoin(serverID, channelID, true, false)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		err = vc.Disconnect()
-		if err != nil {
-			log.Error().Err(err).Msg("failed to disconnect from voice channel")
-		}
-	}()
-
-	log.Info().Msg("start recording...")
-	recorder := NewRecorder(filePrefix, withSplitted)
-	err = recorder.Record(ctx, vc)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func contextWithSignal(ctx context.Context, ch chan struct{}) context.Context {
