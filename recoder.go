@@ -159,10 +159,12 @@ func (r *separatedRecorder) writePacket(p *discordgo.Packet) error {
 
 func (r *separatedRecorder) Close() error {
 	var mErr multiError
+	log.Info().Msg("flushing...")
 	if err := r.flushBuffer(len(r.buff)); err != nil {
 		mErr = append(mErr, err)
 	}
 
+	log.Info().Msg("closing...")
 	for _, rr := range r.fileRecorders {
 		if err := rr.Close(); err != nil {
 			mErr = append(mErr, err)
@@ -239,9 +241,9 @@ func (r *fileRecorder) recordRawPCM(samples []int16) error {
 }
 
 func (r *fileRecorder) insertSilentSamples(count uint32) error {
-	zr := &limitedZeroReader{N: int64(pcmWaveMetaFormat.BlockAlign()) * int64(count)}
+	zr := limitedZeroReader{N: int64(pcmWaveMetaFormat.BlockAlign()) * int64(count)}
 	if buffered := r.buffWriter.Buffered(); buffered > 0 {
-		_, err := io.CopyN(r.buffWriter, zr, int64(r.buffWriter.Available()))
+		_, err := io.CopyN(r.buffWriter, &zr, int64(r.buffWriter.Available()))
 		if err != nil {
 			return err
 		}
@@ -259,6 +261,7 @@ func (r *fileRecorder) insertSilentSamples(count uint32) error {
 }
 
 func (r *fileRecorder) Close() error {
+	log.Info().Msg("bufio flushing...")
 	err := r.buffWriter.Flush()
 	if err != nil {
 		_ = r.sampleWriter.Close()
@@ -266,12 +269,14 @@ func (r *fileRecorder) Close() error {
 		return err
 	}
 
+	log.Info().Msg("closing sample writer...")
 	err = r.sampleWriter.Close()
 	if err != nil {
 		_ = r.f.Close()
 		return err
 	}
 
+	log.Info().Msg("closing writer...")
 	return r.f.Close()
 }
 
@@ -288,12 +293,12 @@ func (r *limitedZeroReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	if r.N > int64(len(p)) {
+	if r.N < int64(len(p)) {
 		p = p[:r.N]
 	}
 
 	var n int
-	for r.N > 0 {
+	for r.N > 0 && len(p) > 0 {
 		bulkSize := 4096
 		if r.N < 4096 {
 			bulkSize = int(r.N)
@@ -303,6 +308,7 @@ func (r *limitedZeroReader) Read(p []byte) (int, error) {
 		}
 
 		copy(p, empty4096b[:bulkSize])
+		p = p[bulkSize:]
 		n += bulkSize
 	}
 

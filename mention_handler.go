@@ -123,6 +123,7 @@ func (h *MentionHandler) handleRecMessage(s *discordgo.Session, m *discordgo.Mes
 			VoiceChannelID:    voiceChannelID,
 			FilePrefix:        filepath.Join(m.Author.ID, msgTimestamp.Format("20060102"), m.ID),
 			DisconnectionChan: make(chan struct{}),
+			MessageChan:       make(chan string),
 			ErrorChan:         make(chan error),
 		}
 		h.running = &req
@@ -143,6 +144,7 @@ func (h *MentionHandler) handleRecMessage(s *discordgo.Session, m *discordgo.Mes
 			for {
 				msg, ok := <-req.MessageChan
 				if !ok {
+					log.Debug().Msg("closed")
 					return
 				}
 

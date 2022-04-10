@@ -71,9 +71,9 @@ func Run(ctx context.Context, botToken string, serverID string, outDir string) e
 					req.Complete(err)
 					return
 				}
+				req.Println("finish recording!")
 
-				req.Message("finish recording! ")
-
+				req.Println("start finalizing...")
 				mixer := NewAudioMixer(filepath.Join(outDir, req.FilePrefix))
 				err = mixer.Mixdown(ctx)
 				if err != nil {
@@ -82,6 +82,7 @@ func Run(ctx context.Context, botToken string, serverID string, outDir string) e
 					return
 				}
 
+				req.Println("complete!")
 				req.Complete(nil)
 			}(req)
 		}
