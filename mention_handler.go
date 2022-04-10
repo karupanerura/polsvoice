@@ -31,13 +31,23 @@ type RecordingRequest struct {
 	VoiceChannelID    string
 	FilePrefix        string
 	DisconnectionChan chan struct{}
+	MessageChan       chan string
 	ErrorChan         chan error
+}
+
+func (r *RecordingRequest) Println(s string) {
+	r.MessageChan <- s
+}
+
+func (r *RecordingRequest) Printf(format string, a ...any) {
+	r.Println(fmt.Sprintf(format, a...))
 }
 
 func (r *RecordingRequest) Complete(err error) {
 	if err != nil {
 		r.ErrorChan <- err
 	}
+	close(r.MessageChan)
 	close(r.ErrorChan)
 }
 
@@ -123,10 +133,23 @@ func (h *MentionHandler) handleRecMessage(s *discordgo.Session, m *discordgo.Mes
 			if aborted := err != nil; aborted {
 				_, err = s.ChannelMessageSend(m.ChannelID, "Aborted...")
 				if err != nil {
-					log.Error().Err(err).Msg("failed to response to rec msg")
+					log.Error().Err(err).Msg("failed to post to error msg")
 				}
 
 				h.running = nil
+			}
+		}()
+		go func() {
+			for {
+				msg, ok := <-req.MessageChan
+				if !ok {
+					return
+				}
+
+				_, err = s.ChannelMessageSend(m.ChannelID, msg)
+				if err != nil {
+					log.Error().Err(err).Msg("failed to post msg")
+				}
 			}
 		}()
 

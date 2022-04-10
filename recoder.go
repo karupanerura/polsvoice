@@ -16,23 +16,19 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-const numOfAudioChannels = wavebin.StereoChannels
-const samplingRate = 48000
-const samplingBit = 16
+var pcmWaveMetaFormat = wavebin.NewPCMMetaFormat(wavebin.StereoChannels, 48000, 16)
 
 type Recorder struct {
-	filePrefix   string
-	withSplitted bool
+	filePrefix string
 }
 
-func NewRecorder(filePrefix string, withSplitted bool) *Recorder {
+func NewRecorder(filePrefix string) *Recorder {
 	return &Recorder{
-		filePrefix:   filePrefix,
-		withSplitted: withSplitted,
+		filePrefix: filePrefix,
 	}
 }
 
-func (r *Recorder) prepaseDir() error {
+func (r *Recorder) prepareDir() error {
 	if os.IsPathSeparator(r.filePrefix[len(r.filePrefix)-1]) {
 		return os.MkdirAll(r.filePrefix, os.ModeDir|0o755)
 	}
@@ -41,36 +37,23 @@ func (r *Recorder) prepaseDir() error {
 }
 
 func (r *Recorder) Record(ctx context.Context, vc *discordgo.VoiceConnection) error {
-	if err := r.prepaseDir(); err != nil {
+	if err := r.prepareDir(); err != nil {
 		return err
 	}
 
-	mixedRecorder, err := newFileRecorder(r.filePrefix + ".wav")
-	if err != nil {
-		log.Error().Err(err).Msgf("failed to open file %q", r.filePrefix+".wav")
-		return err
-	}
-
-	var splitedRecorder recorder = nopRecorder{}
-	if r.withSplitted {
-		splitedRecorder = newSplittedRecorder(r.filePrefix)
-	}
+	separatedRecorder := newSeparatedRecorder(r.filePrefix)
 
 	rx := make(chan *discordgo.Packet, 2)
 	go dgvoice.ReceivePCM(vc, rx)
 
 	var p *discordgo.Packet
+	var err error
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info().Msg("finalizing...")
 
-			err := mixedRecorder.Close()
-			if err != nil {
-				log.Error().Err(err).Msg("failed to finalize PCM recording")
-			}
-
-			err = splitedRecorder.Close()
+			err = separatedRecorder.Close()
 			if err != nil {
 				log.Error().Err(err).Msg("failed to finalize PCM recording")
 			}
@@ -79,12 +62,7 @@ func (r *Recorder) Record(ctx context.Context, vc *discordgo.VoiceConnection) er
 
 			return err
 		case p = <-rx:
-			err := mixedRecorder.recordFromPacket(p)
-			if err != nil {
-				log.Error().Err(err).Msg("failed to write PCM")
-			}
-
-			err = splitedRecorder.recordFromPacket(p)
+			err = separatedRecorder.recordFromPacket(p)
 			if err != nil {
 				log.Error().Err(err).Msg("failed to write PCM")
 			}
@@ -92,36 +70,67 @@ func (r *Recorder) Record(ctx context.Context, vc *discordgo.VoiceConnection) er
 	}
 }
 
-type recorder interface {
-	recordFromPacket(p *discordgo.Packet) error
-	io.Closer
+type separatedRecorder struct {
+	filePrefix     string
+	buff           []*discordgo.Packet
+	fileRecorders  map[uint32]*fileRecorder
+	lastTimestamps map[uint32]uint32
+	firstTimestamp *uint32
 }
 
-type nopRecorder struct{}
-
-func (r nopRecorder) recordFromPacket(p *discordgo.Packet) error {
-	return nil
-}
-
-func (r nopRecorder) Close() error {
-	return nil
-}
-
-type splittedRecorder struct {
-	filePrefix string
-	m          map[uint32]recorder
-}
-
-func newSplittedRecorder(filePrefix string) *splittedRecorder {
-	return &splittedRecorder{
-		filePrefix: filePrefix,
-		m:          map[uint32]recorder{},
+func newSeparatedRecorder(filePrefix string) *separatedRecorder {
+	return &separatedRecorder{
+		filePrefix:     filePrefix,
+		buff:           make([]*discordgo.Packet, 0, packetBuffLen),
+		fileRecorders:  map[uint32]*fileRecorder{},
+		lastTimestamps: map[uint32]uint32{},
 	}
 }
 
-func (r *splittedRecorder) recordFromPacket(p *discordgo.Packet) error {
-	if rec, ok := r.m[p.SSRC]; ok {
-		return rec.recordFromPacket(p)
+func (r *separatedRecorder) recordFromPacket(p *discordgo.Packet) error {
+	r.buff = append(r.buff, p)
+	if len(r.buff) >= packetBuffLen {
+		return r.flushBuffer(len(r.buff) / 2)
+	}
+
+	return nil
+}
+
+func (r *separatedRecorder) flushBuffer(max int) error {
+	sort.Slice(r.buff, func(i, j int) bool {
+		return r.buff[i].Sequence < r.buff[j].Sequence
+	})
+	if r.firstTimestamp == nil {
+		r.firstTimestamp = new(uint32)
+		*r.firstTimestamp = r.buff[0].Timestamp
+	}
+
+	for _, p := range r.buff[:max] {
+		if err := r.writePacket(p); err != nil {
+			return err
+		}
+	}
+	if max < len(r.buff) {
+		copy(r.buff[:max], r.buff[max:])
+	}
+	r.buff = r.buff[:len(r.buff)-max]
+
+	return nil
+}
+
+func (r *separatedRecorder) writePacket(p *discordgo.Packet) error {
+	if rec, ok := r.fileRecorders[p.SSRC]; ok {
+		if lastTimestamp := r.lastTimestamps[p.SSRC]; lastTimestamp < p.Timestamp {
+			samples := p.Timestamp - lastTimestamp
+			if err := rec.insertSilentSamples(samples); err != nil {
+				return err
+			}
+		}
+
+		r.lastTimestamps[p.SSRC] = p.Timestamp + uint32(len(p.PCM))
+		if err := rec.recordRawPCM(p.PCM); err != nil {
+			return err
+		}
 	} else {
 		fileName := fmt.Sprintf("%s-%d.wav", r.filePrefix, p.SSRC)
 		rec, err := newFileRecorder(fileName)
@@ -129,16 +138,33 @@ func (r *splittedRecorder) recordFromPacket(p *discordgo.Packet) error {
 			return err
 		}
 
-		r.m[p.SSRC] = rec
-		return rec.recordFromPacket(p)
+		r.fileRecorders[p.SSRC] = rec
+		r.lastTimestamps[p.SSRC] = p.Timestamp + uint32(len(p.PCM))
+
+		// insert silent samples for first
+		if *r.firstTimestamp < p.Timestamp {
+			samples := p.Timestamp - *r.firstTimestamp
+			if err := rec.insertSilentSamples(samples); err != nil {
+				return err
+			}
+		}
+
+		if err = rec.recordRawPCM(p.PCM); err != nil {
+			return err
+		}
 	}
+
+	return nil
 }
 
-func (r *splittedRecorder) Close() error {
+func (r *separatedRecorder) Close() error {
 	var mErr multiError
-	for _, rr := range r.m {
-		err := rr.Close()
-		if err != nil {
+	if err := r.flushBuffer(len(r.buff)); err != nil {
+		mErr = append(mErr, err)
+	}
+
+	for _, rr := range r.fileRecorders {
+		if err := rr.Close(); err != nil {
 			mErr = append(mErr, err)
 		}
 	}
@@ -171,11 +197,9 @@ func (e multiError) Error() string {
 const packetBuffLen = 256
 
 type fileRecorder struct {
-	f                 *os.File
-	sampleWriter      io.WriteCloser
-	bufioWriter       *bufio.Writer
-	buff              []*discordgo.Packet
-	lastWrittenPacket *discordgo.Packet
+	f            *os.File
+	sampleWriter io.WriteCloser
+	buffWriter   *bufio.Writer
 }
 
 func newFileRecorder(fileName string) (*fileRecorder, error) {
@@ -185,7 +209,7 @@ func newFileRecorder(fileName string) (*fileRecorder, error) {
 	}
 
 	w, err := wavebin.CreateSampleWriter(f, &wavebin.ExtendedFormatChunk{
-		MetaFormat: wavebin.NewPCMMetaFormat(wavebin.StereoChannels, samplingRate, samplingBit),
+		MetaFormat: pcmWaveMetaFormat,
 	})
 	if err != nil {
 		return nil, err
@@ -194,71 +218,48 @@ func newFileRecorder(fileName string) (*fileRecorder, error) {
 	return &fileRecorder{
 		f:            f,
 		sampleWriter: w,
-		bufioWriter:  bufio.NewWriter(w),
-		buff:         make([]*discordgo.Packet, 0, packetBuffLen),
+		buffWriter:   bufio.NewWriter(w),
 	}, nil
 }
 
-func (r *fileRecorder) recordFromPacket(p *discordgo.Packet) error {
-	r.buff = append(r.buff, p)
-	if len(r.buff) >= packetBuffLen {
-		return r.flushBuffer(len(r.buff) / 2)
+func (r *fileRecorder) recordRawPCM(samples []int16) error {
+	pcmWriter := wavebin.PCMWriter[wavebin.PCM16BitStereoSample]{W: r.buffWriter}
+	pcmLen := len(samples)
+	for i := 0; i < pcmLen; i += 2 {
+		_, err := pcmWriter.WriteSamples(wavebin.PCM16BitStereoSample{
+			L: samples[i],
+			R: samples[i+1],
+		})
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-var muteSample = wavebin.PCM16BitStereoSample{L: 0, R: 0}
-
-func (r *fileRecorder) flushBuffer(max int) error {
-	sort.Slice(r.buff, func(i, j int) bool {
-		return r.buff[i].Sequence < r.buff[j].Sequence
-	})
-
-	pcmWriter := wavebin.PCMWriter{W: r.bufioWriter}
-	for _, p := range r.buff[:max] {
-		if r.lastWrittenPacket != nil {
-			samples := p.Timestamp - r.lastWrittenPacket.Timestamp
-			samples -= uint32(len(r.lastWrittenPacket.PCM) / 2)
-			for ; samples > 0; samples-- {
-				_, err := pcmWriter.WriteSamples(&muteSample)
-				if err != nil {
-					return err
-				}
-			}
+func (r *fileRecorder) insertSilentSamples(count uint32) error {
+	zr := &limitedZeroReader{N: int64(pcmWaveMetaFormat.BlockAlign()) * int64(count)}
+	if buffered := r.buffWriter.Buffered(); buffered > 0 {
+		_, err := io.CopyN(r.buffWriter, zr, int64(r.buffWriter.Available()))
+		if err != nil {
+			return err
 		}
-
-		pcmLen := len(p.PCM)
-		for i := 0; i < pcmLen; i += 2 {
-			sample := wavebin.PCM16BitStereoSample{
-				L: p.PCM[i],
-				R: p.PCM[i+1],
-			}
-
-			_, err := pcmWriter.WriteSamples(&sample)
-			if err != nil {
-				return err
-			}
-		}
-		r.lastWrittenPacket = p
 	}
-	if max < len(r.buff) {
-		copy(r.buff[:max], r.buff[max:])
+	if err := r.buffWriter.Flush(); err != nil {
+		return err
 	}
-	r.buff = r.buff[:max]
+
+	_, err := zr.WriteTo(r.sampleWriter)
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
 
 func (r *fileRecorder) Close() error {
-	err := r.flushBuffer(len(r.buff))
-	if err != nil {
-		_ = r.sampleWriter.Close()
-		_ = r.f.Close()
-		return err
-	}
-
-	err = r.bufioWriter.Flush()
+	err := r.buffWriter.Flush()
 	if err != nil {
 		_ = r.sampleWriter.Close()
 		_ = r.f.Close()
@@ -274,16 +275,58 @@ func (r *fileRecorder) Close() error {
 	return r.f.Close()
 }
 
-func mutedPacket(src *discordgo.Packet) *discordgo.Packet {
-	dst := &discordgo.Packet{
-		SSRC:      src.SSRC,
-		Sequence:  src.Sequence,
-		Timestamp: src.Timestamp,
-		Type:      make([]byte, len(src.Type)),
-		Opus:      make([]byte, len(src.Opus)),
-		PCM:       make([]int16, len(src.PCM)),
+type limitedZeroReader struct {
+	N int64
+}
+
+var (
+	empty4096b [4096]byte
+)
+
+func (r *limitedZeroReader) Read(p []byte) (int, error) {
+	if r.N == 0 {
+		return 0, io.EOF
 	}
-	copy(dst.Type, src.Type) // keep content
-	copy(dst.Opus, src.Opus) // keep content
-	return dst
+
+	if r.N > int64(len(p)) {
+		p = p[:r.N]
+	}
+
+	var n int
+	for r.N > 0 {
+		bulkSize := 4096
+		if r.N < 4096 {
+			bulkSize = int(r.N)
+		}
+		if bulkSize > len(p) {
+			bulkSize = len(p)
+		}
+
+		copy(p, empty4096b[:bulkSize])
+		n += bulkSize
+	}
+
+	return n, nil
+}
+func (r *limitedZeroReader) WriteTo(w io.Writer) (n int64, err error) {
+	for r.N > 0 {
+		var nn int
+		if r.N < 4096 {
+			nn, err = w.Write(empty4096b[:r.N])
+			n += int64(nn)
+			r.N -= int64(nn)
+			if err != nil {
+				return
+			}
+		} else {
+			nn, err = w.Write(empty4096b[:])
+			n += int64(nn)
+			r.N -= int64(nn)
+			if err != nil {
+				return
+			}
+		}
+	}
+
+	return
 }

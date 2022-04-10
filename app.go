@@ -64,10 +64,20 @@ func Run(ctx context.Context, botToken string, serverID string, outDir string) e
 				}()
 
 				log.Info().Msg("start recording...")
-				recorder := NewRecorder(filepath.Join(outDir, req.FilePrefix), true)
+				recorder := NewRecorder(filepath.Join(outDir, req.FilePrefix))
 				err = recorder.Record(ctx, vc)
 				if err != nil {
 					log.Error().Err(err).Msgf("failed to recording: %v", err)
+					req.Complete(err)
+					return
+				}
+
+				req.Message("finish recording! ")
+
+				mixer := NewAudioMixer(filepath.Join(outDir, req.FilePrefix))
+				err = mixer.Mixdown(ctx)
+				if err != nil {
+					log.Error().Err(err).Msgf("failed to mixdonw: %v", err)
 					req.Complete(err)
 					return
 				}
