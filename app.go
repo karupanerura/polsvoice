@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync"
 	"syscall"
 
 	"github.com/bwmarrin/discordgo"
@@ -38,16 +37,12 @@ func Run(ctx context.Context, botToken string, serverID string, outDir string) e
 	defer mentionHandler.Terminate()
 	defer removeMentionHandler()
 
-	wg := sync.WaitGroup{}
 	for {
 		select {
 		case <-ctx.Done():
-			wg.Wait()
 			return nil
 		case req := <-mentionHandler.StartRecChan:
-			wg.Add(1)
-			go func(req RecordingRequest) {
-				defer wg.Done()
+			func(req RecordingRequest) {
 				ctx := contextWithSignal(ctx, req.DisconnectionChan)
 
 				vc, err := discord.ChannelVoiceJoin(serverID, req.VoiceChannelID, true, false)
@@ -82,7 +77,7 @@ func Run(ctx context.Context, botToken string, serverID string, outDir string) e
 					return
 				}
 
-				req.Println("complete!")
+				req.Println("complete! download from: https://team-nyanco.preview.karupas.org/polsvoice/"+req.FilePrefix+"-mix.wav")
 				req.Complete(nil)
 			}(req)
 		}

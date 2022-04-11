@@ -88,6 +88,13 @@ func newSeparatedRecorder(filePrefix string) *separatedRecorder {
 }
 
 func (r *separatedRecorder) recordFromPacket(p *discordgo.Packet) error {
+	if r.firstTimestamp == nil {
+		r.firstTimestamp = new(uint32)
+		*r.firstTimestamp = p.Timestamp
+	} else if p.Timestamp < *r.firstTimestamp {
+		*r.firstTimestamp = p.Timestamp
+	}
+
 	r.buff = append(r.buff, p)
 	if len(r.buff) >= packetBuffLen {
 		return r.flushBuffer(len(r.buff) / 2)
@@ -100,10 +107,6 @@ func (r *separatedRecorder) flushBuffer(max int) error {
 	sort.Slice(r.buff, func(i, j int) bool {
 		return r.buff[i].Sequence < r.buff[j].Sequence
 	})
-	if r.firstTimestamp == nil {
-		r.firstTimestamp = new(uint32)
-		*r.firstTimestamp = r.buff[0].Timestamp
-	}
 
 	for _, p := range r.buff[:max] {
 		if err := r.writePacket(p); err != nil {
