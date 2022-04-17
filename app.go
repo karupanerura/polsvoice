@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
 	"github.com/bwmarrin/discordgo"
@@ -32,7 +31,7 @@ func Run(ctx context.Context, botToken string, serverID string, outDir string) e
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	defer cancel()
 
-	mentionHandler := NewMentionHandler(serverID)
+	mentionHandler := NewMentionHandler(serverID, outDir)
 	removeMentionHandler := discord.AddHandler(mentionHandler.Handle)
 	defer mentionHandler.Terminate()
 	defer removeMentionHandler()
@@ -63,7 +62,7 @@ func Run(ctx context.Context, botToken string, serverID string, outDir string) e
 			}()
 
 			log.Info().Msg("start recording...")
-			recorder := NewRecorder(filepath.Join(outDir, req.FilePrefix))
+			recorder := NewRecorder(req.FilePrefix)
 			err = recorder.Record(vc)
 			if err != nil {
 				log.Error().Err(err).Msgf("failed to recording: %v", err)
@@ -73,7 +72,7 @@ func Run(ctx context.Context, botToken string, serverID string, outDir string) e
 			req.Println("finish recording!")
 
 			req.Println("start finalizing...")
-			mixer := NewAudioMixer(filepath.Join(outDir, req.FilePrefix))
+			mixer := NewAudioMixer(req.FilePrefix)
 			err = mixer.Mixdown(ctx)
 			if err != nil {
 				log.Error().Err(err).Msgf("failed to mixdonw: %v", err)

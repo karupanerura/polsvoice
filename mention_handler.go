@@ -2,6 +2,7 @@ package polsvoice
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -14,15 +15,17 @@ import (
 
 type MentionHandler struct {
 	ServerID     string
+	OutDir       string
 	StartRecChan chan RecordingRequest
 
 	mu      sync.Mutex
 	running *RecordingRequest
 }
 
-func NewMentionHandler(serverID string) *MentionHandler {
+func NewMentionHandler(serverID, outDir string) *MentionHandler {
 	return &MentionHandler{
 		ServerID:     serverID,
+		OutDir:       outDir,
 		StartRecChan: make(chan RecordingRequest),
 	}
 }
@@ -53,6 +56,7 @@ func (r *RecordingRequest) Complete(err error) {
 
 var recMsgRe = regexp.MustCompile("\\s+rec\\s+(.+)$")
 var finishMsgRe = regexp.MustCompile("\\s+finish\\s+(.+)$")
+var deleteMsgRe = regexp.MustCompile("\\s+delete$")
 
 func (h *MentionHandler) Handle(s *discordgo.Session, m *discordgo.MessageCreate) {
 	selfUserID := s.State.User.ID
@@ -86,6 +90,11 @@ func (h *MentionHandler) Handle(s *discordgo.Session, m *discordgo.MessageCreate
 		return
 	}
 
+	if deleteMsgRe.MatchString(m.Content) {
+		go h.handleDeleteMessage(s, m)
+		return
+	}
+
 	h.handleUnknownMessage(s, m)
 }
 
@@ -97,31 +106,32 @@ func (h *MentionHandler) handleRecMessage(s *discordgo.Session, m *discordgo.Mes
 		if err != nil {
 			log.Error().Err(err).Msg("failed to response to rec msg")
 		}
+		return
 	}
 	if voiceChannelID == "" {
 		_, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("%q is not a voice channel, isn't it?", voiceChannelName))
 		if err != nil {
 			log.Error().Err(err).Msg("failed to response to rec msg")
 		}
+		return
 	}
 
-	msgID, err := strconv.ParseUint(m.ID, 10, 64)
+	filePrefix, err := generateFilePrefix(m.Message, h.OutDir)
 	if err != nil {
-		log.Error().Err(err).Msg("failed to get channel list")
+		log.Error().Err(err).Msg("failed to parse message id")
 		_, err := s.ChannelMessageSend(m.ChannelID, "Oops! Please retry")
 		if err != nil {
 			log.Error().Err(err).Msg("failed to response to rec msg")
 		}
+		return
 	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.running == nil {
-		msgTimestampMsecs := (msgID >> 22) + 1420070400000
-		msgTimestamp := time.Unix(int64(msgTimestampMsecs/1000), int64((msgTimestampMsecs%1000)*1000*1000))
 		req := RecordingRequest{
 			VoiceChannelID:    voiceChannelID,
-			FilePrefix:        filepath.Join(m.Author.ID, msgTimestamp.Format("20060102"), m.ID),
+			FilePrefix:        filePrefix,
 			DisconnectionChan: make(chan struct{}),
 			MessageChan:       make(chan string),
 			ErrorChan:         make(chan error),
@@ -175,12 +185,14 @@ func (h *MentionHandler) handleFinishMessage(s *discordgo.Session, m *discordgo.
 		if err != nil {
 			log.Error().Err(err).Msg("failed to response to rec msg")
 		}
+		return
 	}
 	if voiceChannelID == "" {
 		_, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("%q is not a voice channel, isn't it?", voiceChannelName))
 		if err != nil {
 			log.Error().Err(err).Msg("failed to response to rec msg")
 		}
+		return
 	}
 
 	h.mu.Lock()
@@ -198,6 +210,73 @@ func (h *MentionHandler) handleFinishMessage(s *discordgo.Session, m *discordgo.
 
 		close(h.running.DisconnectionChan)
 		h.running = nil
+	}
+}
+
+func (h *MentionHandler) handleDeleteMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
+	if m.MessageReference == nil {
+		_, err := s.ChannelMessageSend(m.ChannelID, "please reply it for the target recoding request message.")
+		if err != nil {
+			log.Error().Err(err).Msg("failed to response to delete msg")
+		}
+		return
+	}
+
+	msg, err := s.ChannelMessage(m.MessageReference.ChannelID, m.MessageReference.MessageID)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to get referenced message")
+		_, err := s.ChannelMessageSend(m.ChannelID, "Oops! Please retry")
+		if err != nil {
+			log.Error().Err(err).Msg("failed to response to delete msg")
+		}
+		return
+	}
+
+	filePrefix, err := generateFilePrefix(msg, h.OutDir)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to parse message id")
+		_, err := s.ChannelMessageSend(m.ChannelID, "Oops! Please retry")
+		if err != nil {
+			log.Error().Err(err).Msg("failed to response to delete msg")
+		}
+		return
+	}
+
+	matches, err := filepath.Glob(filePrefix + "*.wav")
+	if err != nil {
+		log.Error().Err(err).Msg("failed to glob files")
+		_, err := s.ChannelMessageSend(m.ChannelID, "Oops! Please retry")
+		if err != nil {
+			log.Error().Err(err).Msg("failed to response to delete msg")
+		}
+		return
+	}
+	if len(matches) == 0 {
+		_, err := s.ChannelMessageSend(m.ChannelID, "no recerded files for the recording request.")
+		if err != nil {
+			log.Error().Err(err).Msg("failed to response to delete msg")
+		}
+		return
+	}
+
+	var mErr multiError
+	for _, filePath := range matches {
+		log.Debug().Msgf("remove %s", filePath)
+		err := os.Remove(filePath)
+		if err != nil {
+			mErr = append(mErr, err)
+		}
+	}
+	if len(mErr) == 0 {
+		_, err := s.ChannelMessageSend(m.ChannelID, "successful to delete all recorded files.")
+		if err != nil {
+			log.Error().Err(err).Msg("failed to response to delete msg")
+		}
+	} else {
+		_, err := s.ChannelMessageSend(m.ChannelID, "Oops! Please retry")
+		if err != nil {
+			log.Error().Err(err).Msg("failed to response to delete msg")
+		}
 	}
 }
 
@@ -229,4 +308,15 @@ func (h *MentionHandler) handleUnknownMessage(s *discordgo.Session, m *discordgo
 	if err != nil {
 		log.Error().Err(err).Msg("failed to response to unknown msg")
 	}
+}
+
+func generateFilePrefix(m *discordgo.Message, outDir string) (string, error) {
+	msgID, err := strconv.ParseUint(m.ID, 10, 64)
+	if err != nil {
+		return "", err
+	}
+
+	msgTimestampMsecs := (msgID >> 22) + 1420070400000
+	msgTimestamp := time.Unix(int64(msgTimestampMsecs/1000), int64((msgTimestampMsecs%1000)*1000*1000))
+	return filepath.Join(outDir, m.Author.ID, msgTimestamp.Format("20060102"), m.ID), nil
 }
