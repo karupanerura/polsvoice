@@ -150,8 +150,8 @@ func mix(samples []wavebin.PCM16BitStereoSample, decrDb float64) (mixed wavebin.
 	}
 
 	for _, sample := range samples {
-		mixed.L = peakLimitMix16(mixed.L, int16(math.Round(float64(sample.L)*math.Log10(decrDb))))
-		mixed.R = peakLimitMix16(mixed.R, int16(math.Round(float64(sample.R)*math.Log10(decrDb))))
+		mixed.L = peakLimitMix16(mixed.L, int16(math.Round(float64(sample.L)*math.Pow(10.0, decrDb/20.0))))
+		mixed.R = peakLimitMix16(mixed.R, int16(math.Round(float64(sample.R)*math.Pow(10.0, decrDb/20.0))))
 	}
 	return mixed
 }
