@@ -2,15 +2,13 @@ package polsvoice
 
 import (
 	"bufio"
-	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
+	"time"
 
-	"github.com/bwmarrin/dgvoice"
 	"github.com/bwmarrin/discordgo"
 	"github.com/karupanerura/wavebin"
 	"github.com/rs/zerolog/log"
@@ -36,92 +34,57 @@ func (r *Recorder) prepareDir() error {
 	return os.MkdirAll(filepath.Dir(r.filePrefix), os.ModeDir|0o755)
 }
 
-func (r *Recorder) Record(ctx context.Context, vc *discordgo.VoiceConnection) error {
+func (r *Recorder) Record(vc *discordgo.VoiceConnection) error {
 	if err := r.prepareDir(); err != nil {
 		return err
 	}
 
 	separatedRecorder := newSeparatedRecorder(r.filePrefix)
 
-	rx := make(chan *discordgo.Packet, 2)
-	go dgvoice.ReceivePCM(vc, rx)
+	rx := make(chan DecodedDiscordPacket, 2)
+	go func() {
+		err := ReceiveAndDecodePacket(vc, rx)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to receive packet")
+		}
+		close(rx)
+	}()
 
-	var p *discordgo.Packet
+	var p DecodedDiscordPacket
 	var err error
-	for {
-		select {
-		case <-ctx.Done():
-			log.Info().Msg("finalizing...")
-
-			err = separatedRecorder.Close()
-			if err != nil {
-				log.Error().Err(err).Msg("failed to finalize PCM recording")
-			}
-
-			// MEMO should flush all remained packets in rx channel?
-
-			return err
-		case p = <-rx:
-			err = separatedRecorder.recordFromPacket(p)
-			if err != nil {
-				log.Error().Err(err).Msg("failed to write PCM")
-			}
+	for p = range rx {
+		err = separatedRecorder.recordFromPacket(p)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to write PCM")
 		}
 	}
+
+	log.Info().Msg("finalizing...")
+
+	err = separatedRecorder.Close()
+	if err != nil {
+		log.Error().Err(err).Msg("failed to finalize PCM recording")
+	}
+
+	return err
 }
 
 type separatedRecorder struct {
 	filePrefix     string
-	buff           []*discordgo.Packet
 	fileRecorders  map[uint32]*fileRecorder
 	lastTimestamps map[uint32]uint32
-	firstTimestamp *uint32
+	firstReceivedAt time.Time
 }
 
 func newSeparatedRecorder(filePrefix string) *separatedRecorder {
 	return &separatedRecorder{
 		filePrefix:     filePrefix,
-		buff:           make([]*discordgo.Packet, 0, packetBuffLen),
 		fileRecorders:  map[uint32]*fileRecorder{},
 		lastTimestamps: map[uint32]uint32{},
 	}
 }
 
-func (r *separatedRecorder) recordFromPacket(p *discordgo.Packet) error {
-	if r.firstTimestamp == nil {
-		r.firstTimestamp = new(uint32)
-		*r.firstTimestamp = p.Timestamp
-	} else if p.Timestamp < *r.firstTimestamp {
-		*r.firstTimestamp = p.Timestamp
-	}
-
-	r.buff = append(r.buff, p)
-	if len(r.buff) >= packetBuffLen {
-		return r.flushBuffer(len(r.buff) / 2)
-	}
-
-	return nil
-}
-
-func (r *separatedRecorder) flushBuffer(max int) error {
-	sort.Slice(r.buff, func(i, j int) bool {
-		return r.buff[i].Sequence < r.buff[j].Sequence
-	})
-
-	for _, p := range r.buff[:max] {
-		if err := r.writePacket(p); err != nil {
-			return err
-		}
-	}
-	if max < len(r.buff) {
-		copy(r.buff[:max], r.buff[max:])
-	}
-	r.buff = r.buff[:len(r.buff)-max]
-
-	return nil
-}
-
-func (r *separatedRecorder) writePacket(p *discordgo.Packet) error {
+func (r *separatedRecorder) recordFromPacket(p DecodedDiscordPacket) error {
 	if rec, ok := r.fileRecorders[p.SSRC]; ok {
 		if lastTimestamp := r.lastTimestamps[p.SSRC]; lastTimestamp < p.Timestamp {
 			samples := p.Timestamp - lastTimestamp
@@ -129,8 +92,8 @@ func (r *separatedRecorder) writePacket(p *discordgo.Packet) error {
 				return err
 			}
 		}
+		r.lastTimestamps[p.SSRC] = p.Timestamp + uint32(len(p.PCM) / 2)
 
-		r.lastTimestamps[p.SSRC] = p.Timestamp + uint32(len(p.PCM))
 		if err := rec.recordRawPCM(p.PCM); err != nil {
 			return err
 		}
@@ -142,11 +105,20 @@ func (r *separatedRecorder) writePacket(p *discordgo.Packet) error {
 		}
 
 		r.fileRecorders[p.SSRC] = rec
-		r.lastTimestamps[p.SSRC] = p.Timestamp + uint32(len(p.PCM))
+		r.lastTimestamps[p.SSRC] = p.Timestamp + uint32(len(p.PCM)/2)
+
+		log.Debug().Msgf("First Timestamp[%d]: %d (samples:%d)", p.SSRC, p.Timestamp, len(p.PCM))
+		log.Debug().Msgf("First Sequence[%d]: %d", p.SSRC, p.Sequence)
+		log.Debug().Msgf("First ReceivedAt: %v", r.firstReceivedAt)
+		log.Debug().Msgf("Current ReceivedAt: %v", p.ReceivedAt)
+		log.Debug().Msgf("ReceivedAt Diff: %v", p.ReceivedAt.Sub(r.firstReceivedAt))
 
 		// insert silent samples for first
-		if *r.firstTimestamp < p.Timestamp {
-			samples := p.Timestamp - *r.firstTimestamp
+		if r.firstReceivedAt.IsZero() {
+			r.firstReceivedAt = p.ReceivedAt
+		} else if r.firstReceivedAt.Before(p.ReceivedAt) {
+			msec := p.ReceivedAt.Sub(r.firstReceivedAt).Milliseconds()
+			samples := uint32(msec*48)
 			if err := rec.insertSilentSamples(samples); err != nil {
 				return err
 			}
@@ -162,12 +134,6 @@ func (r *separatedRecorder) writePacket(p *discordgo.Packet) error {
 
 func (r *separatedRecorder) Close() error {
 	var mErr multiError
-	log.Info().Msg("flushing...")
-	if err := r.flushBuffer(len(r.buff)); err != nil {
-		mErr = append(mErr, err)
-	}
-
-	log.Info().Msg("closing...")
 	for _, rr := range r.fileRecorders {
 		if err := rr.Close(); err != nil {
 			mErr = append(mErr, err)
@@ -198,8 +164,6 @@ func (e multiError) Error() string {
 
 	return s.String()
 }
-
-const packetBuffLen = 256
 
 type fileRecorder struct {
 	f            *os.File

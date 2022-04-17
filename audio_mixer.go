@@ -102,7 +102,7 @@ func (m *AudioMixer) Mixdown(ctx context.Context) error {
 	}
 
 	samples := make([]wavebin.PCM16BitStereoSample, len(availableSets))
-	for len(samples) != 0 {
+	for len(availableSets) != 0 {
 		// read from all available sample channels
 		for i := range availableSets {
 			ch := sampleChannels[i]
@@ -111,11 +111,9 @@ func (m *AudioMixer) Mixdown(ctx context.Context) error {
 			samples[i], ok = <-ch
 			if !ok {
 				delete(availableSets, i)
-				samples = samples[:len(samples)-1]
-				continue
 			}
 		}
-		if len(samples) == 0 {
+		if len(availableSets) == 0 {
 			break
 		}
 
