@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/bwmarrin/discordgo"
@@ -75,12 +76,19 @@ func Run(ctx context.Context, botToken string, serverID string, outDir string) e
 			mixer := NewAudioMixer(req.FilePrefix)
 			err = mixer.Mixdown(ctx)
 			if err != nil {
-				log.Error().Err(err).Msgf("failed to mixdonw: %v", err)
+				log.Error().Err(err).Msgf("failed to mixdown: %v", err)
 				req.Complete(err)
 				continue
 			}
 
-			req.Println("complete! download from: https://team-nyanco.preview.karupas.org/polsvoice/" + req.FilePrefix + "-mix.wav")
+			urlPathPrefix, err := filepath.Rel(outDir, req.FilePrefix)
+			if err != nil {
+				log.Error().Err(err).Msgf("failed to get relative path from %q to %q: %v", outDir, req.FilePrefix, err)
+				req.Complete(err)
+				continue
+			}
+
+			req.Println("complete! download from: https://team-nyanco.preview.karupas.org/polsvoice/" + urlPathPrefix + "-mix.wav")
 			req.Complete(nil)
 		}
 	}
